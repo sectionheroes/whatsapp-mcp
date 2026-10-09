@@ -23,6 +23,7 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 - **Contact Search**: Search contacts by name or phone number with `sender_display` format ("Name (phone)")
 - **Send Messages**: Send text messages to individuals or groups
 - **Media Support**: Send and download images, videos, documents, and voice messages
+- **Voice Note Transcription**: Transcribe voice messages locally with faster-whisper — audio never leaves the machine, transcripts are cached and attached to `list_messages` results ([details](#voice-note-transcription))
 - **Call History**: Capture incoming voice/video calls into a local SQLite table (live, 1:1 and group)
 - **Webhook Integration**: Forward incoming messages to external services
 - **Local Storage**: All messages stored locally in SQLite - only sent to Claude when you allow it
@@ -340,6 +341,7 @@ Copy `.env.example` to `.env` and configure as needed:
 | `WHATSAPP_MCP_TRANSPORT` | `stdio`                                | MCP transport to serve clients: `stdio`, `http`, or `sse` |
 | `WHATSAPP_MCP_HOST`    | `127.0.0.1`                              | Bind address for the `http`/`sse` transports |
 | `WHATSAPP_MCP_PORT`    | `8000`                                   | Port for the `http`/`sse` transports |
+| `WHISPER_MODEL`        | `medium`                                 | faster-whisper model for voice note transcription (see [Voice note transcription](#voice-note-transcription)) |
 
 ### MCP transport (stdio vs http/sse)
 
@@ -406,9 +408,10 @@ files there before calling `send_file` or `send_audio_message`, or set
 ### Run automatically on macOS
 
 macOS users can install optional per-user `launchd` jobs that start the Go
-bridge at login and monitor it every 60 seconds for API health, disconnects, and
-QR relink signals. The installer does not require `sudo` and does not install or
-start the MCP server.
+bridge at login, monitor it every 60 seconds for API health, disconnects and QR
+relink signals, keep the voice note transcript cache warm, and evict old media.
+The installer does not require `sudo` and does not install or start the MCP
+server.
 
 ```bash
 scripts/install-launchd-macos.sh
@@ -420,8 +423,16 @@ available, writes generated support files to
 `~/Library/LaunchAgents/`, and writes logs to `~/Library/Logs/whatsapp-mcp/`.
 It safely reloads only these labels:
 
-- `com.whatsapp-mcp.bridge`
-- `com.whatsapp-mcp.bridge-monitor`
+| Label | Schedule | Purpose |
+| ----- | -------- | ------- |
+| `com.whatsapp-mcp.bridge` | at login, kept alive | Runs the Go bridge |
+| `com.whatsapp-mcp.bridge-monitor` | every 60 s | Health, disconnect and QR-relink notifications |
+| `com.whatsapp-mcp.transcribe-backlog` | every 2 h | Transcribes new voice notes into the cache |
+| `com.whatsapp-mcp.media-cleanup` | every 3 days | Deletes images/videos/stickers older than 3 days |
+
+The last two are optional extras. `transcribe-backlog` is skipped with a warning
+when `whatsapp-mcp-server/.venv` does not exist yet — run `uv sync` in
+`whatsapp-mcp-server/` and re-run the installer to add it.
 
 To customize the launchd environment, export values before running the installer.
 Re-run the installer after changing them.
@@ -431,6 +442,13 @@ export WHATSAPP_BRIDGE_PORT=8080
 export WEBHOOK_URL=http://localhost:8769/whatsapp/webhook
 export FORWARD_SELF=false
 export WHATSAPP_MEDIA_ROOTS="$HOME/.local/share/whatsapp-mcp/outbox"
+
+# Transcription backlog and media cleanup
+export WHATSAPP_MCP_TRANSCRIBE_HOURS=36      # how far back each run looks
+export WHATSAPP_MCP_TRANSCRIBE_LIMIT=60      # max voice notes per run
+export WHATSAPP_MCP_TRANSCRIBE_INTERVAL=7200 # seconds between runs
+export WHATSAPP_MCP_CLEANUP_INTERVAL=259200  # seconds between media cleanups
+
 scripts/install-launchd-macos.sh
 ```
 
@@ -441,6 +459,8 @@ launchctl print gui/$(id -u)/com.whatsapp-mcp.bridge
 launchctl print gui/$(id -u)/com.whatsapp-mcp.bridge-monitor
 tail -n 100 ~/Library/Logs/whatsapp-mcp/bridge.err.log
 tail -n 100 ~/Library/Logs/whatsapp-mcp/monitor.err.log
+tail -n 100 ~/Library/Logs/whatsapp-mcp/transcribe.out.log
+tail -n 100 ~/Library/Logs/whatsapp-mcp/media-cleanup.log
 ```
 
 The monitor sends a macOS notification once per failure type until recovery. It
@@ -489,6 +509,80 @@ Caveats:
 - **The phone decides the actual cap.** The flag requests up to 10 years / 100 GB, but WhatsApp's iOS primary device enforces its own retention policy. iPad companion is documented at ~1 year max; other linked devices appear to follow similar logic.
 - **Only effective on a fresh pair.** With `whatsapp.db` already present, no new pair handshake fires and the flag is a no-op.
 - **Messages the phone has deleted are not recoverable** — auto-expire, low-storage cleanup, and manual delete all leave no trace for the phone to share.
+
+## Voice note transcription
+
+Voice messages are transcribed on this machine with
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper). The audio never
+leaves the host and no transcription API is involved. The model is downloaded
+once from Hugging Face on first use and cached in `~/.cache/huggingface`.
+
+### How transcripts reach you
+
+`list_messages` attaches transcripts to audio messages automatically: each voice
+note gets a `transcription` field, and the text is also inlined into `content`
+as `[Sprachnachricht] …`. In the common case you never call a transcription tool
+yourself — you just read the chat and the text is there.
+
+Transcripts are cached in `transcripts.db`, which lives next to `messages.db`
+but in its own file so that the bridge's writes cannot lock it. The cache is the
+source of truth: re-running transcription over the same messages is cheap and
+skips everything already done.
+
+### Two limits worth knowing
+
+**Per-call limit.** `list_messages` transcribes at most
+`max_new_transcriptions` uncached voice notes per call (default `5`), newest
+first. Anything beyond that comes back with `transcription: null` and
+`transcription_note: "per-call limit reached"`. Call `transcribe_voice_message`
+for those, or let the backlog job (below) catch up.
+
+**Process-wide model lock.** The model is loaded lazily behind a mutex, so a
+single server process transcribes one voice note at a time. Issuing parallel
+transcription calls buys you nothing, runs into client timeouts, and risks
+discarding work that was nearly done. Transcribe sequentially. Budget roughly
+30 s of CPU per voice note on Apple Silicon (`int8`, realtime factor ≈ 2.2).
+
+### Model choice
+
+`WHISPER_MODEL` defaults to `medium` rather than a smaller model on purpose:
+the smaller ones degrade noticeably on non-English audio, and German voice notes
+in particular come back unusable from `tiny`/`base`. Set it to `small` if you
+need lower memory, or `large-v3` if accuracy matters more than speed:
+
+```bash
+WHISPER_MODEL=large-v3 uv run main.py
+```
+
+Note that FFmpeg is not required for transcription — faster-whisper decodes the
+audio itself. FFmpeg is only needed to *send* voice messages.
+
+### Warming the cache ahead of time
+
+`scripts/transcribe-backlog.py` transcribes untranscribed voice notes in bulk so
+that reading a chat later does not have to transcribe inline:
+
+```bash
+# Last 36 hours, at most 60 voice notes
+whatsapp-mcp-server/.venv/bin/python scripts/transcribe-backlog.py --hours 36 --limit 60
+```
+
+On macOS the installer registers this as a LaunchAgent that runs every two hours
+(see [Run automatically on macOS](#run-automatically-on-macos)). To force a run
+immediately instead of waiting for the next interval:
+
+```bash
+launchctl kickstart gui/$(id -u)/com.whatsapp-mcp.transcribe-backlog
+```
+
+Omit `-k` so that a run already in progress is not killed. Before issuing a
+large `list_messages` call, check that the backlog job has finished — otherwise
+both compete for the model lock:
+
+```bash
+# First column is "-" when the job is not running
+launchctl list | grep transcribe-backlog
+```
 
 ## Call History
 

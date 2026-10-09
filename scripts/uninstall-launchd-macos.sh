@@ -3,6 +3,8 @@ set -euo pipefail
 
 BRIDGE_LABEL="com.whatsapp-mcp.bridge"
 MONITOR_LABEL="com.whatsapp-mcp.bridge-monitor"
+TRANSCRIBE_LABEL="com.whatsapp-mcp.transcribe-backlog"
+CLEANUP_LABEL="com.whatsapp-mcp.media-cleanup"
 
 fail() {
   print -r -- "Error: $1" >&2
@@ -17,6 +19,8 @@ LOG_DIR="$HOME/Library/Logs/whatsapp-mcp"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 BRIDGE_PLIST="$LAUNCH_AGENTS_DIR/$BRIDGE_LABEL.plist"
 MONITOR_PLIST="$LAUNCH_AGENTS_DIR/$MONITOR_LABEL.plist"
+TRANSCRIBE_PLIST="$LAUNCH_AGENTS_DIR/$TRANSCRIBE_LABEL.plist"
+CLEANUP_PLIST="$LAUNCH_AGENTS_DIR/$CLEANUP_LABEL.plist"
 LAUNCHD_DOMAIN="gui/$(id -u)"
 
 bootout_label() {
@@ -25,10 +29,12 @@ bootout_label() {
 }
 
 print -r -- "Stopping whatsapp-mcp LaunchAgents if present..."
+bootout_label "$CLEANUP_LABEL"
+bootout_label "$TRANSCRIBE_LABEL"
 bootout_label "$MONITOR_LABEL"
 bootout_label "$BRIDGE_LABEL"
 
-rm -f "$BRIDGE_PLIST" "$MONITOR_PLIST"
+rm -f "$BRIDGE_PLIST" "$MONITOR_PLIST" "$TRANSCRIBE_PLIST" "$CLEANUP_PLIST"
 rm -f "$SUPPORT_DIR/run-whatsapp-bridge.sh"
 rm -f "$SUPPORT_DIR/monitor-whatsapp-bridge.sh"
 rm -f "$SUPPORT_DIR/launchd.env"
@@ -36,5 +42,5 @@ rm -rf "$SUPPORT_DIR/state"
 rmdir "$SUPPORT_DIR" 2>/dev/null || true
 
 print -r -- "Removed whatsapp-mcp LaunchAgents and generated support files."
-print -r -- "Preserved bridge data under whatsapp-bridge/store/."
+print -r -- "Preserved bridge data under whatsapp-bridge/store/, including the transcript cache."
 print -r -- "Logs were left in place: $LOG_DIR"
